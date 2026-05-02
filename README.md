@@ -103,8 +103,6 @@ The threat model is simple: you're running multiple agent processes on the same 
 
 I tried raw sockets first.  You end up rewriting message framing, dealing with partial reads, managing poll loops, and still getting it wrong.  ZMQ handles all of that.  `pip install pyzmq` and you're done.
 
-Also: ZMQ's `PUSH/PULL` pattern is exactly the right abstraction for this.  Each agent is a pull-only sink.  Senders push and forget.  No connection management needed.
-
 ## License
 
 MIT
