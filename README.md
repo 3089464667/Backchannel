@@ -1,108 +1,124 @@
-# AgentIPC
+# Backchannel
 
-**Sub-millisecond inter-agent communication over Unix domain sockets.  Zero open ports.**
+**Private, sub-millisecond communication between AI agents.  Zero open ports.  Nothing to configure.**
 
-I built this because my three AI agents (running as separate processes on one machine) needed to talk to each other.  The obvious options all sucked:
+I built this because I had three agents running as separate processes on one server, and they couldn't talk to each other.  Here's what I tried and why each one failed:
 
-- **File polling** — one agent writes a file, the other's cron picks it up 60 seconds later.  Too slow.
-- **HTTP** — now I'm binding ports, managing auth, parsing headers.  Too heavy.
-- **Redis / NATS / RabbitMQ** — external dependency, more attack surface.
-- Agents on different social platforms can't easily send messages to each other directly.
+| What I tried | Why it sucked |
+|---|---|
+| **File polling** (cron every 60s) | An agent asks a question, waits a full minute for the answer |
+| **HTTP** | Now I'm managing ports, auth tokens, and serialization.  For same-machine messages. |
+| **Redis pub/sub** | External dependency, more attack surface, overkill for 3 processes |
+| **Discord bots** | My local agent needs the internet to talk to the agent next door? |
 
-AgentIPC is none of those.  It's a thin layer over ZeroMQ PUSH/PULL sockets.  Each agent runs a tiny daemon that binds a Unix domain socket.  Sending a message is a one-shot PUSH connect, send, disconnect.  The receiving daemon polls and queues.  That's it.
+Backchannel is none of those.  It's a tiny daemon that binds a Unix domain socket.  Sending a message is a transient connection — push, send, disconnect.  No persistent connections, no broker, no open ports.
 
-## Quick start
+<p align="center">
+  <img src="demo.gif" alt="Backchannel demo" width="700">
+</p>
+
+## In one minute
 
 ```bash
-pip install agentipc   # or: pip install -e .
+pip install backchannel
 
 # Tell it who your agents are
-echo "analyst"  > /etc/agentipc/peers.conf
-echo "executor" >> /etc/agentipc/peers.conf
-echo "reviewer" >> /etc/agentipc/peers.conf
+echo "analyst"  > /etc/backchannel/peers.conf
+echo "executor" >> /etc/backchannel/peers.conf
 
-# Start daemons (one per agent process)
-systemctl enable --now agentipc@analyst
-systemctl enable --now agentipc@executor
+# Start daemons
+backchanneld analyst &
+backchanneld executor &
 
-# Send a message from anywhere
-AGENTIPC_SENDER=analyst agentc executor "review PR #42, auth module"
+# Send a message — from any process, anywhere on the machine
+BACKCHANNEL_SENDER=analyst bc executor "review PR #42, auth module"
 ```
 
-Or without systemd, just run it directly:
+That's it.  The executor gets it in under a millisecond.
 
-```bash
-python3 -m agentipc.daemon analyst &
-python3 -m agentipc.daemon executor &
+## What you actually get
 
-agentc executor "hello from analyst"
-```
-
-## What it gives you
-
-| | File polling | HTTP | AgentIPC |
+| | File polling | HTTP | Backchannel |
 |---|---|---|---|
-| Latency | 1-60 seconds | 5-20 ms | **<1 ms** |
+| Latency | 1–60 seconds | 5–20 ms | **< 1 ms** |
 | Open ports | 0 | 1+ | **0** |
-| External deps | 0 | 0 | libzmq |
-| Session tracking | no | yes (DIY) | **SYN/ACK/FIN** |
-| Multi-agent broadcast | no | needs pubsub | **PUB/SUB built-in** |
+| External deps | 0 | 0 | none beyond pip |
+| Session tracking | no | DIY | **SYN/ACK/FIN built in** |
+| Know if delivered | no | yes (200) | **yes (SYN-ACK)** |
+
+## The session thing
+
+This is the part I actually care about.  Most agent communication is fire-and-forget — you send a string into the void and hope.  Backchannel has a TCP-style handshake:
+
+```
+analyst                          executor
+  |  ---- SYN  + task --------->  |
+  |  <--- SYN-ACK --------------  |
+  |                                |
+  |  ---- DATA: "review PR #42" -> |
+  |  <--- DATA: "found a bug" ---  |
+  |                                |
+  |  ---- FIN: "done" -----------> |
+  |  <--- FIN-ACK ---------------  |
+```
+
+You call `session = mgr.connect("executor", "code review")` and you actually know if they accepted.  You know the session is alive.  You know when it closes.  This isn't revolutionary — it's what TCP has done since 1974.  But nobody built it into agent communication before.
+
+## Code
+
+```python
+from backchannel import Bus
+from backchannel.session import SessionManager
+
+bus = Bus("analyst", peers=["analyst", "executor"])
+bus.start(daemon_mode=True)
+
+mgr = SessionManager("analyst", bus)
+mgr.on_data(lambda session, content: print(f"Got: {content}"))
+mgr.start()
+
+# Connect to another agent
+session = mgr.connect("executor", "security audit for auth module")
+if session:
+    mgr.send_data(session, "starting review now")
+    # ... work happens ...
+    mgr.close(session, "audit complete")
+```
 
 ## Architecture
 
 ```
-┌──────────┐    PUSH (transient)    ┌──────────┐
-│ analyst  │ ──────────────────────>│ executor │
-│ daemon   │                        │ daemon   │
-│          │                        │          │
-│ PULL ◄───│──────────────┐         │ PULL ◄───│─── ...
-│ PUB  ────│─────┐        │         │ PUB  ────│─── ...
-│ REP  ◄───│──┐  │        │         │ REP  ◄───│──┐
-└──────────┘  │  │        │         └──────────┘  │
-              │  │        └── SUB ────────────────┘
-              │  └─────────── SUB ────────────────┘
-              └──── REP query: "any messages for me?"
+┌──────────┐    transient push     ┌──────────┐
+│ analyst  │ ────────────────────> │ executor │
+│ daemon   │                       │ daemon   │
+│          │                       │          │
+│ PULL <───│───────── ...          │ PULL <───│─── ...
+│ PUB  ────│─── ...                │ PUB  ────│─── ...
+│ REP  <───│── query               │ REP  <───│── query
+└──────────┘                       └──────────┘
 ```
 
-- **PULL** — every agent daemon binds one.  Other agents PUSH to it.
-- **PUB/SUB** — broadcast channel.  Used for protocol replies (SYN-ACK, FIN-ACK) so the sender doesn't have to keep a PULL bound.
-- **REP** — the agent process queries its own daemon: "any pending messages?"  No polling files, no cron.
+Each daemon binds PULL to receive.  Senders transiently connect PUSH to send.  PUB/SUB carries protocol handshakes.  The agent polls its own daemon's REP socket: "any messages for me?"  No files, no cron, no polling the filesystem.
 
-## The session protocol
+## Security model
 
-AgentIPC has a TCP-style session handshake.  This matters because without it you can't tell if the other side actually received your message, or if you're talking into a void.
+Unix domain sockets with `0600` permissions.  No TCP ports.  Only processes running as the same user can connect.  Messages are plain JSON — if you need encryption you're probably doing cross-machine communication, and this isn't for that.
 
-```
-analyst                        executor
-  │  ── SYN + task ──────────>  │
-  │  <── SYN-ACK ─────────────  │
-  │                              │
-  │  ── DATA: "review PR #42" ─> │
-  │  <── DATA: "found a bug" ──  │
-  │                              │
-  │  ── FIN: "done" ──────────> │
-  │  <── FIN-ACK ──────────────  │
-```
+The threat model is simple: you're running agent processes on the same box and you trust them.  If you don't trust your own processes you have bigger problems than IPC.
 
-The daemon handles SYN/SYN-ACK/FIN/FIN-ACK automatically.
+## When *not* to use it
 
-## Security
+- **Cross-machine.**  Use HTTP, gRPC, or NATS.  This is same-machine only.
+- **Thousands of messages per second.**  The library can handle it, but this was designed for agent collaboration — tens of messages a minute, not millions.
+- **You need a durable message queue.**  Messages are held in memory.  Daemon restart = queue lost.  If you need persistence, layer it on top.
 
-- Unix domain sockets with `0600` permissions.  Only root (or the same user) can connect.
-- Zero TCP ports.  Nothing listens on the network.
-- Messages are plain JSON.  If you need encryption you're probably doing cross-machine communication, and AgentIPC isn't for that.
+## Why not just use `multiprocessing.Queue`?
 
-The threat model is simple: you're running multiple agent processes on the same box and you trust them.  If you don't trust your own processes you have bigger problems than IPC.
+Because my agents aren't child processes.  They're independent systemd services with their own Python interpreters.  `multiprocessing` doesn't work across independent processes.
 
-## When NOT to use it
+## Why Unix sockets instead of a message broker?
 
-- **Cross-machine communication** — use HTTP, gRPC, or NATS.  AgentIPC is same-machine only.
-- **Thousands of messages per second** — ZMQ can handle it, but this tool is built for agent collaboration (tens of messages per minute, not millions).
-- **You need a message broker with persistence** — use RabbitMQ.  AgentIPC delivers or it doesn't; there's no disk-backed queue.
-
-## Why ZeroMQ instead of raw Unix sockets?
-
-I tried raw sockets first.  You end up rewriting message framing, dealing with partial reads, managing poll loops, and still getting it wrong.  ZMQ handles all of that.  `pip install pyzmq` and you're done.
+I tried Redis.  I tried NATS.  Both are great.  Both also mean another service to install, configure, secure, and monitor.  For three processes on one machine, that's infrastructure bloat.  Unix sockets are built into the kernel.  They've been there since 1983.  No daemon needed beyond the agent's own.
 
 ## License
 

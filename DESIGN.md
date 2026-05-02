@@ -1,118 +1,89 @@
-# AgentIPC — Design & Rationale
+# Backchannel — Design & Rationale
 
-## Why this exists
+## The problem that started this
 
-In late 2025 I had three AI agents running as separate Python processes on a single server.  They needed to collaborate — one researches, one runs experiments, one writes.  They sat in different tmux windows and had no way to talk to each other.
+Late 2025.  I had three AI agents, three tmux windows, one server.  They needed to collaborate — one researches, one runs experiments, one writes.  They had no way to speak to each other.
 
-What I tried, in order:
+I hacked together file-based messaging first.  Agent A drops a markdown file in a shared directory.  Agent B's cron picks it up 60 seconds later.  It worked.  But when an agent needs a decision and the other is waiting, 60 seconds feels like an hour.  The whole point of agents is autonomy — why are they bottlenecked on a cron job?
 
-1. **Files in a shared directory, polled by cron.**  Worked, but the minimum latency was 60 seconds.  An agent would ask a question and wait a full minute for the answer.  The polling also added constant CPU overhead.
+Then I tried TCP.  Then I tried Discord bots.  Then I realized I was solving the wrong problem.  I didn't need a messaging platform.  I needed the Unix equivalent of leaning over to the next desk and saying "hey, look at this."
 
-2. **TCP sockets with a custom wire protocol.**  Now I had to manage ports, auth tokens, reconnection logic, and partial reads.  And I'd opened a port — even on localhost, that bothered me.
+## What Backchannel is
 
-3. **Discord bots forwarding messages.**  Three bots, one Discord server, each agent was its own bot user.  It worked surprisingly well for async messages, but it felt wrong.  Why does my local agent need Discord's servers to send a string to the process next door?  Also: rate limits, outages, and the 2000-character message cap.
+Backchannel is a transport layer.  It delivers bytes from process A to process B on the same machine.  It doesn't know what the bytes mean, doesn't care what LLM you're using, doesn't orchestrate workflows.
 
-4. **ZeroMQ PUSH/PULL over IPC.**  No ports.  No serialization overhead.  No external services.  Sub-millisecond delivery.  One `pip install`.  This was the right answer.
+It's not CrewAI, AutoGen, or LangGraph.  Those handle task allocation, agent roles, and execution flow.  Backchannel sits underneath — it's the wire they could use instead of HTTP or in-process function calls.
 
-## What AgentIPC is and isn't
+Think of it as the TCP of agent communication.  TCP doesn't know about HTTP, SMTP, or SSH.  It delivers bytes reliably.  Backchannel doesn't know about prompts, tool calls, or reasoning chains.  It delivers messages between agent processes on the same machine, sub-millisecond, with session tracking.
 
-**It is** a transport layer.  It moves bytes from process A to process B on the same machine.  It doesn't know what the bytes mean.  It doesn't care what LLM you're using.  It doesn't orchestrate workflows.
+## The transport: PUSH/PULL over Unix domain sockets
 
-**It isn't** an orchestration framework.  Tools like CrewAI, AutoGen, and LangGraph handle task allocation, agent roles, and execution flow.  AgentIPC sits underneath those — it's the wire they could use instead of HTTP or in-process function calls.
+Why PUSH/PULL instead of request-reply?  Because agents don't always need an immediate answer.  An agent might fire off a progress update and keep working.  It might ask a question that takes the other agent 30 seconds of reasoning to answer.  Request-reply forces synchronous waiting.  PUSH/PULL is one-way — push and forget.  If you need a reply, start a session and wait for DATA frames.
 
-Think of it as the TCP of agent communication.  TCP doesn't know about HTTP, SMTP, or SSH.  It just delivers bytes reliably.  AgentIPC doesn't know about prompts, tool calls, or reasoning chains.  It just delivers messages between agent processes.
+Why Unix domain sockets instead of TCP?  Because if I'm binding a port — even on localhost — I've created an attack surface.  Unix sockets are files.  `chmod 0600` and only the same user can touch them.  No firewall rules, no port conflicts, no "is this port already in use" at 3 AM.
 
-## The PUSH/PULL pattern
+The key design decision: **the sender never binds a socket.**  It connects transiently, pushes the message, and disconnects.  Only the daemon binds.  This eliminates connection management entirely — no reconnection logic, no half-open sockets, no "who's connected to whom" state.
 
-ZeroMQ has several socket patterns.  Here's why I chose PUSH/PULL:
+## Why there's a daemon
 
-- **REQ/REP** — synchronous request-reply.  Too rigid.  An agent might send a question and not need an immediate answer.
-- **PUB/SUB** — one-to-many broadcast.  Good for notifications, but no way to target a specific recipient.
-- **ROUTER/DEALER** — async request-reply with routing.  Powerful but complex.  Overkill.
-- **PUSH/PULL** — one-way pipeline.  Perfect.  Each agent binds a PULL socket.  Senders transiently connect a PUSH, send, disconnect.  The daemon polls the PULL and queues messages.
+"Why not just have the agent process open a socket directly?"
 
-The key insight: **the sender never binds a socket**.  It just connects, pushes, and disconnects.  Only the daemon binds.  This means there are no persistent connections to manage, no reconnection logic, no half-open sockets.
+Three reasons:
 
-PUB/SUB is used in parallel for protocol control messages (SYN-ACK, FIN-ACK).  When agent A sends a SYN to agent B, it temporarily subscribes to B's PUB socket to receive the SYN-ACK.  This avoids requiring agent A to also bind a PULL (which would conflict with its own daemon).
+1. **Crash resilience.**  The agent process is an LLM — it can crash, OOM, or get stuck in an infinite loop.  Messages sent during downtime are queued by the daemon.  When the agent comes back, it polls: "what did I miss?"
 
-## The session protocol
+2. **Separation of concerns.**  The agent shouldn't know about socket management.  It asks its daemon "any messages?" and gets a JSON response.  The daemon handles polling, queue management, and protocol handshakes.
 
-A lot of agent communication tools are fire-and-forget: send a message and hope the other side got it.  I wanted sessions.
+3. **Systemd integration.**  A daemon means `systemctl enable backchanneld@analyst`.  Automatic restart on crash.  Logging to journald.  Standard lifecycle management.  No custom supervisor scripts.
 
-The session protocol is a stripped-down TCP handshake:
+## The session protocol: why it matters
 
-```
-SYN     → "I want to start a session.  Here's the task."
-SYN-ACK ← "I got it.  Session established."
-DATA    ↔ bidirectional payloads
-FIN     → "Session done."
-FIN-ACK ← "Acknowledged."
-```
+Most agent communication tools are fire-and-forget.  You send a message and hope.  I wanted to know if the other side actually received it.
 
-This gives you:
-
-- **Confirmation**: you know the other side received your connection request.
-- **Task context**: the SYN carries a task description, so the receiver knows what this session is about before the first DATA frame.
-- **Clean teardown**: FIN/FIN-ACK means you can clean up state on both sides.
-- **Session tracking**: the daemon maintains a count of active sessions and pending message counts per session.  You can query these at any time.
-
-### Why not just put everything in the message body?
-
-You could.  But then every agent would need to parse the body, figure out if it's a new conversation or a continuation, and manage state themselves.  The session protocol moves that boilerplate into the transport layer where it belongs.
-
-### Timeouts and edge cases
-
-- **SYN timeout**: if the target daemon doesn't respond with SYN-ACK within 30 seconds, the session is abandoned.
-- **Daemon crash**: if a daemon dies, its sessions are lost.  On restart, it starts fresh.  This is deliberate — AgentIPC is not a durable message queue.  If you need persistence across restarts, layer it on top.
-- **Double SYN**: duplicate SYNs with the same session_id are ignored.
-
-## Daemon design
-
-Each agent identity runs one `agentipcd` process, managed by systemd.  Why a daemon?
-
-- The agent process might crash or restart.  Messages sent during downtime are lost, but as soon as the agent comes back, it can query the daemon for pending messages.  (Currently the daemon holds messages in memory.  See "Future work" for persistence.)
-- Separating the transport daemon from the agent process means the agent doesn't need to manage ZMQ sockets directly.  It just polls the REP socket.
-- Systemd gives us auto-restart, logging to journald, and a standard way to manage lifecycle.
-
-The REP socket is the agent's interface to its daemon:
+The protocol is a TCP-style handshake stripped to its essentials:
 
 ```
-Agent → REP "QUERY"    → daemon returns: active sessions + pending message counts
-Agent → REP "ACK:sid" → daemon clears that session's pending queue
-Agent → REP "PING"    → daemon returns "pong" + counts
+SYN     — "I want to start a session.  Here's the task."
+SYN-ACK — "Got it.  Session established."
+DATA    — bidirectional payloads
+FIN     — "Session done."
+FIN-ACK — "Acknowledged.  Cleaning up."
 ```
+
+Why include the task in the SYN?  Because the receiver should know what this session is about before the first message arrives.  If an agent gets a SYN that says "security audit for auth module," it can prepare context, load relevant files, even reject the session if it's too busy.  The SYN is a negotiation, not a demand.
+
+Why FIN-ACK instead of just dropping the connection?  Because state leaks.  If one side closes a session and the other doesn't know, it keeps polling, keeps a session object alive in memory, keeps waiting for messages that will never come.  FIN-ACK is a contract: "we both agree this is over."
+
+### Edge cases we handle
+
+- **Duplicate SYN:** If the same session_id arrives twice, ignore it.  Don't create a duplicate session.
+- **Daemon crash during session:** Sessions are in-memory only.  When the daemon restarts, it starts fresh.  The agent must re-establish sessions.  This is deliberate — Backchannel is not a durable message queue.  If you need guaranteed delivery across restarts, you need a persistence layer.
+- **SYN timeout:** 30 seconds.  If the target daemon doesn't respond, the session is abandoned.  No hanging connections.
+
+## What I'd do differently
+
+1. **Disk-backed queues.**  If the daemon restarts, pending messages are gone.  For most agent workflows this is fine — the agent reconnects and the sender retries.  But a SQLite-backed queue would make it more robust without adding infrastructure.
+
+2. **Message compression.**  Agent messages can get long — full reasoning traces, code diffs, tool outputs.  Currently sent as plain JSON.  Compression would be trivial to add.
+
+3. **Observability.**  Prometheus metrics for message counts, latency histograms, session duration.  Right now you're blind without `journalctl`.
+
+4. **Multi-user isolation.**  Currently any process that can access the socket directory can send messages.  Fine for single-user machines.  Not fine for shared servers.  Unix socket credentials (SO_PEERCRED) could verify the sender's UID.
 
 ## Comparisons
 
 ### vs. MCP (Model Context Protocol)
 
-MCP is a client-server protocol for LLMs to call tools.  It uses stdio or HTTP as transport.  AgentIPC is a transport layer for agent-to-agent communication.  You could run MCP over AgentIPC (replace stdio with ZMQ IPC), but they solve different problems.
+MCP is a client-server protocol for LLMs to call tools.  It uses stdio or HTTP as transport.  Backchannel is a transport for agent-to-agent messages.  They solve different problems, but they could compose — MCP over Backchannel instead of MCP over stdio.
 
-### vs. Google A2A (Agent-to-Agent)
+### vs. Google A2A
 
-A2A defines how agents advertise capabilities, negotiate tasks, and return artifacts.  It's an application-layer protocol.  AgentIPC is a transport.  They're complementary — A2A could use AgentIPC as its transport instead of HTTP.
+A2A is an application-layer protocol: how agents describe capabilities, negotiate tasks, return artifacts.  Backchannel is a transport layer.  A2A could use Backchannel as its wire protocol instead of HTTP, and everything above the transport would stay the same.
 
-### vs. NATS / Redis Pub/Sub
+### vs. NATS / Redis
 
-Both are excellent message brokers.  They also require running a separate server process, binding network ports, and managing authentication.  For same-machine communication between a handful of agents, that's too much infrastructure.  For cross-machine or high-throughput scenarios, they're the right choice.
+Both are excellent message brokers with features Backchannel doesn't have — persistence, clustering, auth, multi-tenancy.  They're also separate services you have to run.  Backchannel is a library plus a tiny daemon.  Trade infrastructure complexity for features.
 
-## Future work
+## Why I stopped looking and shipped this
 
-- **Disk-backed message queue.**  Currently messages are held in memory.  If the daemon restarts, pending messages are lost.  A SQLite-backed queue would make it durable.
-- **Message compression.**  Agent messages can get long (full reasoning traces).  ZMQ doesn't compress by default.
-- **Observability.**  Prometheus metrics for message counts, latency, session duration.
-- **Access control.**  Currently any process with access to the socket directory can send messages.  Fine for single-user machines, not for multi-tenant.
-
-## Why not just use `multiprocessing.Queue`?
-
-Because my agents aren't child processes.  They're independent systemd services, started separately, with their own Python interpreters and virtual environments.  `multiprocessing` only works within a single parent process.
-
-## Why ZeroMQ instead of nanomsg / nng?
-
-nanomsg and its successor nng are great libraries.  They're cleaner than ZMQ in many ways.  But ZMQ has:
-
-- Mature Python bindings (`pyzmq` — 3600+ stars, battle-tested)
-- Better documentation and community
-- PUSH/PULL semantics that map perfectly to my use case
-
-If someone ports AgentIPC to nng, I'd love to see it.  The protocol is simple enough.
+I spent two weeks evaluating options.  At some point I realized: three processes, one machine, need to send strings to each other.  This shouldn't require a research project.  Unix has had sockets since 1983.  The hard part isn't the technology — it's the session tracking, the daemon architecture, the protocol design.  Once those were right, the transport was the easy part.

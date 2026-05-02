@@ -1,0 +1,15 @@
+[Unit]
+Description=Backchannel daemon for %i
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 -m backchannel.daemon %i
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

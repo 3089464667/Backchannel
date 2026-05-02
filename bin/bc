@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""
+bc — Backchannel CLI
+
+Send messages between agent daemons on the same machine.
+No ports, no auth, no external services — just Unix domain sockets.
+
+Usage:
+  bc executor "review PR #42, auth module"
+  bc all "rollback window closing in 5 minutes"
+
+  bc connect reviewer "security audit for MCP plugin"
+  bc msg reviewer "found three issues so far"
+  bc disconnect reviewer --reason "audit complete"
+
+Environment:
+  BACKCHANNEL_SENDER   agent name (default: hostname)
+  BACKCHANNEL_DIR      socket directory (default: /tmp/backchannel/sockets)
+  BACKCHANNEL_PEERS    comma-separated peer agent names
+"""
+
+import sys, os, json, time, uuid, argparse
+from pathlib import Path
+
+SOCKET_DIR = Path(os.environ.get("BACKCHANNEL_DIR", "/tmp/backchannel/sockets"))
+
+
+def load_peers() -> list[str]:
+    if "BACKCHANNEL_PEERS" in os.environ:
+        return os.environ["BACKCHANNEL_PEERS"].split(",")
+    conf = Path("/etc/backchannel/peers.conf")
+    if conf.exists():
+        return [line.strip() for line in conf.read_text().splitlines()
+                if line.strip() and not line.strip().startswith("#")]
+    return []
+
+
+def _push_to(target: str, body: str):
+    import zmq
+    ctx = zmq.Context()
+    push = ctx.socket(zmq.PUSH)
+    push.connect(f"ipc://{SOCKET_DIR}/{target}.pull")
+    push.send_string(body)
+    push.close()
+    ctx.term()
+
+
+def _send_protocol(sender: str, target: str, msg_type: str, content: str,
+                   session_id: str = "", extra: dict | None = None) -> str:
+    if session_id == "":
+        session_id = uuid.uuid4().hex[:16]
+    msg = {"type": msg_type, "session_id": session_id,
+           "from": sender, "to": target,
+           "content": content, "timestamp": time.time()}
+    if extra:
+        msg.update(extra)
+    _push_to(target, json.dumps(msg, ensure_ascii=False))
+    return session_id
+
+
+def cmd_connect(sender: str, target: str, topic: str, timeout: int = 15):
+    import zmq
+    session_id = uuid.uuid4().hex[:16]
+    _push_to(target, json.dumps({
+        "type": "SYN", "session_id": session_id,
+        "from": sender, "to": target,
+        "content": topic, "task": topic, "timestamp": time.time(),
+    }))
+    print(f"waiting for {target} (timeout {timeout}s)...", file=sys.stderr)
+
+    ctx = zmq.Context()
+    sub = ctx.socket(zmq.SUB)
+    sub.connect(f"ipc://{SOCKET_DIR}/{target}.pub")
+    sub.setsockopt_string(zmq.SUBSCRIBE, sender)
+    time.sleep(0.2)
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            raw = sub.recv_multipart(zmq.NOBLOCK)
+            if len(raw) >= 2:
+                msg = json.loads(raw[-1].decode())
+                if msg.get("type") == "SYN-ACK" and msg.get("from") == target:
+                    sub.close(); ctx.term()
+                    print(f"{target} accepted (session {session_id[:8]})")
+                    print(f"SESSION_ID={session_id}")
+                    return
+        except zmq.Again:
+            time.sleep(0.1)
+    sub.close(); ctx.term()
+    print(f"timeout: {target} did not respond in {timeout}s", file=sys.stderr)
+    sys.exit(2)
+
+
+def cmd_msg(sender: str, target: str, content: str, session_id: str = ""):
+    sid = _send_protocol(sender, target, "DATA", content, session_id)
+    print(sid[:12])
+
+
+def cmd_disconnect(sender: str, target: str, reason: str = "complete",
+                   session_id: str = "", timeout: int = 10):
+    import zmq
+    sid = _send_protocol(sender, target, "FIN", reason, session_id,
+                         extra={"reason": reason})
+    print(f"waiting for {target} to acknowledge...", file=sys.stderr)
+
+    ctx = zmq.Context()
+    sub = ctx.socket(zmq.SUB)
+    sub.connect(f"ipc://{SOCKET_DIR}/{target}.pub")
+    sub.setsockopt_string(zmq.SUBSCRIBE, sender)
+    time.sleep(0.2)
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            raw = sub.recv_multipart(zmq.NOBLOCK)
+            if len(raw) >= 2:
+                msg = json.loads(raw[-1].decode())
+                if msg.get("type") == "FIN-ACK" and msg.get("from") == target:
+                    sub.close(); ctx.term()
+                    print(f"{target} acknowledged disconnect")
+                    return
+        except zmq.Again:
+            time.sleep(0.1)
+
+    sub.close(); ctx.term()
+    print(f"disconnect sent (session {sid[:8]})", file=sys.stderr)
+
+
+def main():
+    if len(sys.argv) >= 3 and sys.argv[1] not in (
+            "connect", "msg", "reply", "disconnect", "-h", "--help"):
+        target = sys.argv[1]
+        content = sys.argv[2]
+        sender = os.environ.get("BACKCHANNEL_SENDER", os.uname().nodename)
+        peers = load_peers()
+        if target == "all":
+            for p in peers:
+                if p != sender:
+                    _send_protocol(sender, p, "DATA", content)
+            print("broadcast sent")
+        elif peers and target in peers:
+            cmd_msg(sender, target, content)
+        else:
+            cmd_msg(sender, target, content)
+        return
+
+    parser = argparse.ArgumentParser(
+        description="Backchannel CLI", epilog="See DESIGN.md for protocol details.")
+    sub = parser.add_subparsers(dest="command")
+    p_connect = sub.add_parser("connect", help="establish a session")
+    p_connect.add_argument("target")
+    p_connect.add_argument("topic", nargs="?", default="task")
+    p_connect.add_argument("--timeout", type=int, default=15)
+    p_msg = sub.add_parser("msg", help="send a message")
+    p_msg.add_argument("target")
+    p_msg.add_argument("content")
+    p_msg.add_argument("--session", default="")
+    p_disc = sub.add_parser("disconnect", help="close a session")
+    p_disc.add_argument("target")
+    p_disc.add_argument("--reason", default="complete")
+    p_disc.add_argument("--session", default="")
+    args = parser.parse_args()
+    sender = os.environ.get("BACKCHANNEL_SENDER", os.uname().nodename)
+    if args.command == "connect":
+        cmd_connect(sender, args.target, args.topic, args.timeout)
+    elif args.command in ("msg", "reply"):
+        cmd_msg(sender, args.target, args.content, args.session)
+    elif args.command == "disconnect":
+        cmd_disconnect(sender, args.target, args.reason, args.session)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
