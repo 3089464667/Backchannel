@@ -13,9 +13,6 @@ I built this because I had three agents running as separate processes on one ser
 
 Backchannel is none of those.  It's a tiny daemon that binds a Unix domain socket.  Sending a message is a transient connection — push, send, disconnect.  No persistent connections, no broker, no open ports.
 
-<p align="center">
-  <img src="demo.gif" alt="Backchannel demo" width="700">
-</p>
 
 ## In one minute
 
